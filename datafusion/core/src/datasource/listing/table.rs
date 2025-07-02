@@ -17,106 +17,135 @@
 
 //! The table implementation.
 
-use super::helpers::{expr_applicable_for_cols, pruned_partition_list};
-use super::{ListingTableUrl, PartitionedFile};
-use std::collections::HashMap;
-use std::{any::Any, str::FromStr, sync::Arc};
-
-use crate::datasource::{
-    create_ordering,
-    file_format::{
-        file_compression_type::FileCompressionType, FileFormat, FilePushdownSupport,
-    },
-    physical_plan::FileSinkConfig,
+use super::{
+    helpers::{expr_applicable_for_cols, pruned_partition_list},
+    ListingTableUrl, PartitionedFile,
 };
-use crate::execution::context::SessionState;
-use datafusion_catalog::TableProvider;
-use datafusion_common::{config_err, DataFusionError, Result};
-use datafusion_datasource::file_scan_config::{FileScanConfig, FileScanConfigBuilder};
-use datafusion_expr::dml::InsertOp;
-use datafusion_expr::{utils::conjunction, Expr, TableProviderFilterPushDown};
-use datafusion_expr::{SortExpr, TableType};
-use datafusion_physical_plan::empty::EmptyExec;
-use datafusion_physical_plan::{ExecutionPlan, Statistics};
-
-use arrow::datatypes::{DataType, Field, Schema, SchemaBuilder, SchemaRef};
-use datafusion_common::{
-    config_datafusion_err, internal_err, plan_err, project_schema, Constraints,
-    SchemaExt, ToDFSchema,
+use crate::{
+    datasource::file_format::{file_compression_type::FileCompressionType, FileFormat},
+    datasource::{create_ordering, physical_plan::FileSinkConfig},
+    execution::context::SessionState,
 };
-use datafusion_execution::cache::{
-    cache_manager::FileStatisticsCache, cache_unit::DefaultFileStatisticsCache,
-};
-use datafusion_physical_expr::{
-    create_physical_expr, LexOrdering, PhysicalSortRequirement,
-};
-
+use arrow::datatypes::{DataType, Field, SchemaBuilder, SchemaRef};
+use arrow_schema::Schema;
 use async_trait::async_trait;
-use datafusion_catalog::Session;
-use datafusion_common::stats::Precision;
-use datafusion_datasource::compute_all_files_statistics;
-use datafusion_datasource::file_groups::FileGroup;
-use datafusion_physical_expr_common::sort_expr::LexRequirement;
+use datafusion_catalog::{Session, TableProvider};
+use datafusion_common::{
+    config_datafusion_err, config_err, internal_err, plan_err, project_schema,
+    stats::Precision, Constraints, DataFusionError, Result, SchemaExt,
+};
+use datafusion_datasource::{
+    compute_all_files_statistics,
+    file_groups::FileGroup,
+    file_scan_config::{FileScanConfig, FileScanConfigBuilder},
+    schema_adapter::DefaultSchemaAdapterFactory,
+};
+use datafusion_execution::{
+    cache::{cache_manager::FileStatisticsCache, cache_unit::DefaultFileStatisticsCache},
+    config::SessionConfig,
+};
+use datafusion_expr::{
+    dml::InsertOp, Expr, SortExpr, TableProviderFilterPushDown, TableType,
+};
+use datafusion_physical_expr_common::sort_expr::LexOrdering;
+use datafusion_physical_plan::{empty::EmptyExec, ExecutionPlan, Statistics};
 use futures::{future, stream, Stream, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use object_store::ObjectStore;
+use std::{any::Any, collections::HashMap, str::FromStr, sync::Arc};
+/// Indicates the source of the schema for a [`ListingTable`]
+// PartialEq required for assert_eq! in tests
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SchemaSource {
+    /// Schema is not yet set (initial state)
+    None,
+    /// Schema was inferred from first table_path
+    Inferred,
+    /// Schema was specified explicitly via with_schema
+    Specified,
+}
 
 /// Configuration for creating a [`ListingTable`]
+///
+///
 #[derive(Debug, Clone)]
 pub struct ListingTableConfig {
     /// Paths on the `ObjectStore` for creating `ListingTable`.
     /// They should share the same schema and object store.
     pub table_paths: Vec<ListingTableUrl>,
     /// Optional `SchemaRef` for the to be created `ListingTable`.
+    ///
+    /// See details on [`ListingTableConfig::with_schema`]
     pub file_schema: Option<SchemaRef>,
-    /// Optional `ListingOptions` for the to be created `ListingTable`.
+    /// Optional [`ListingOptions`] for the to be created [`ListingTable`].
+    ///
+    /// See details on [`ListingTableConfig::with_listing_options`]
     pub options: Option<ListingOptions>,
+    /// Tracks the source of the schema information
+    schema_source: SchemaSource,
 }
 
 impl ListingTableConfig {
-    /// Creates new [`ListingTableConfig`].
-    ///
-    /// The [`SchemaRef`] and [`ListingOptions`] are inferred based on
-    /// the suffix of the provided `table_paths` first element.
+    /// Creates new [`ListingTableConfig`] for reading the specified URL
     pub fn new(table_path: ListingTableUrl) -> Self {
         let table_paths = vec![table_path];
         Self {
             table_paths,
             file_schema: None,
             options: None,
+            schema_source: SchemaSource::None,
         }
     }
 
     /// Creates new [`ListingTableConfig`] with multiple table paths.
     ///
-    /// The [`SchemaRef`] and [`ListingOptions`] are inferred based on
-    /// the suffix of the provided `table_paths` first element.
+    /// See [`Self::infer_options`] for details on what happens with multiple paths
     pub fn new_with_multi_paths(table_paths: Vec<ListingTableUrl>) -> Self {
         Self {
             table_paths,
             file_schema: None,
             options: None,
+            schema_source: SchemaSource::None,
         }
     }
-    /// Add `schema` to [`ListingTableConfig`]
+
+    /// Returns the source of the schema for this configuration
+    pub fn schema_source(&self) -> SchemaSource {
+        self.schema_source
+    }
+    /// Set the `schema` for the overall [`ListingTable`]
+    ///
+    /// [`ListingTable`] will automatically coerce, when possible, the schema
+    /// for individual files to match this schema.
+    ///
+    /// If a schema is not provided, it is inferred using
+    /// [`Self::infer_schema`].
+    ///
+    /// If the schema is provided, it must contain only the fields in the file
+    /// without the table partitioning columns.
     pub fn with_schema(self, schema: SchemaRef) -> Self {
         Self {
             table_paths: self.table_paths,
             file_schema: Some(schema),
             options: self.options,
+            schema_source: SchemaSource::Specified,
         }
     }
 
     /// Add `listing_options` to [`ListingTableConfig`]
+    ///
+    /// If not provided, format and other options are inferred via
+    /// [`Self::infer_options`].
     pub fn with_listing_options(self, listing_options: ListingOptions) -> Self {
         Self {
             table_paths: self.table_paths,
             file_schema: self.file_schema,
             options: Some(listing_options),
+            schema_source: self.schema_source,
         }
     }
 
-    ///Returns a tupe of (file_extension, optional compression_extension)
+    /// Returns a tuple of `(file_extension, optional compression_extension)`
     ///
     /// For example a path ending with blah.test.csv.gz returns `("csv", Some("gz"))`
     /// For example a path ending with blah.test.csv returns `("csv", None)`
@@ -138,7 +167,9 @@ impl ListingTableConfig {
         }
     }
 
-    /// Infer `ListingOptions` based on `table_path` suffix.
+    /// Infer `ListingOptions` based on `table_path` and file suffix.
+    ///
+    /// The format is inferred based on the first `table_path`.
     pub async fn infer_options(self, state: &dyn Session) -> Result<Self> {
         let store = if let Some(url) = self.table_paths.first() {
             state.runtime_env().object_store(url)?
@@ -183,41 +214,68 @@ impl ListingTableConfig {
 
         let listing_options = ListingOptions::new(file_format)
             .with_file_extension(listing_file_extension)
-            .with_target_partitions(state.config().target_partitions());
+            .with_target_partitions(state.config().target_partitions())
+            .with_collect_stat(state.config().collect_statistics());
 
         Ok(Self {
             table_paths: self.table_paths,
             file_schema: self.file_schema,
             options: Some(listing_options),
+            schema_source: self.schema_source,
         })
     }
 
-    /// Infer the [`SchemaRef`] based on `table_path` suffix.  Requires `self.options` to be set prior to using.
+    /// Infer the [`SchemaRef`] based on `table_path`s.
+    ///
+    /// This method infers the table schema using the first `table_path`.
+    /// See [`ListingOptions::infer_schema`] for more details
+    ///
+    /// # Errors
+    /// * if `self.options` is not set. See [`Self::with_listing_options`]
     pub async fn infer_schema(self, state: &dyn Session) -> Result<Self> {
         match self.options {
             Some(options) => {
-                let schema = if let Some(url) = self.table_paths.first() {
-                    options.infer_schema(state, url).await?
-                } else {
-                    Arc::new(Schema::empty())
+                let ListingTableConfig {
+                    table_paths,
+                    file_schema,
+                    options: _,
+                    schema_source,
+                } = self;
+
+                let (schema, new_schema_source) = match file_schema {
+                    Some(schema) => (schema, schema_source), // Keep existing source if schema exists
+                    None => {
+                        if let Some(url) = table_paths.first() {
+                            (
+                                options.infer_schema(state, url).await?,
+                                SchemaSource::Inferred,
+                            )
+                        } else {
+                            (Arc::new(Schema::empty()), SchemaSource::Inferred)
+                        }
+                    }
                 };
 
                 Ok(Self {
-                    table_paths: self.table_paths,
+                    table_paths,
                     file_schema: Some(schema),
                     options: Some(options),
+                    schema_source: new_schema_source,
                 })
             }
             None => internal_err!("No `ListingOptions` set for inferring schema"),
         }
     }
 
-    /// Convenience wrapper for calling `infer_options` and `infer_schema`
+    /// Convenience method to call both [`Self::infer_options`] and [`Self::infer_schema`]
     pub async fn infer(self, state: &dyn Session) -> Result<Self> {
         self.infer_options(state).await?.infer_schema(state).await
     }
 
-    /// Infer the partition columns from the path. Requires `self.options` to be set prior to using.
+    /// Infer the partition columns from `table_paths`.
+    ///
+    /// # Errors
+    /// * if `self.options` is not set. See [`Self::with_listing_options`]
     pub async fn infer_partitions_from_path(self, state: &dyn Session) -> Result<Self> {
         match self.options {
             Some(options) => {
@@ -243,6 +301,7 @@ impl ListingTableConfig {
                     table_paths: self.table_paths,
                     file_schema: self.file_schema,
                     options: Some(options),
+                    schema_source: self.schema_source,
                 })
             }
             None => config_err!("No `ListingOptions` set for inferring schema"),
@@ -277,6 +336,7 @@ pub struct ListingOptions {
     /// parquet metadata.
     ///
     /// See <https://github.com/apache/datafusion/issues/4177>
+    ///
     /// NOTE: This attribute stores all equivalent orderings (the outer `Vec`)
     ///       where each ordering consists of an individual lexicographic
     ///       ordering (encapsulated by a `Vec<Expr>`). If there aren't
@@ -291,16 +351,27 @@ impl ListingOptions {
     /// - use default file extension filter
     /// - no input partition to discover
     /// - one target partition
-    /// - stat collection
+    /// - do not collect statistics
     pub fn new(format: Arc<dyn FileFormat>) -> Self {
         Self {
             file_extension: format.get_ext(),
             format,
             table_partition_cols: vec![],
-            collect_stat: true,
+            collect_stat: false,
             target_partitions: 1,
             file_sort_order: vec![],
         }
+    }
+
+    /// Set options from [`SessionConfig`] and returns self.
+    ///
+    /// Currently this sets `target_partitions` and `collect_stat`
+    /// but if more options are added in the future that need to be coordinated
+    /// they will be synchronized thorugh this method.
+    pub fn with_session_config_options(mut self, config: &SessionConfig) -> Self {
+        self = self.with_target_partitions(config.target_partitions());
+        self = self.with_collect_stat(config.collect_statistics());
+        self
     }
 
     /// Set file extension on [`ListingOptions`] and returns self.
@@ -479,11 +550,13 @@ impl ListingOptions {
     }
 
     /// Infer the schema of the files at the given path on the provided object store.
-    /// The inferred schema does not include the partitioning columns.
     ///
-    /// This method will not be called by the table itself but before creating it.
-    /// This way when creating the logical plan we can decide to resolve the schema
-    /// locally or ask a remote service to do it (e.g a scheduler).
+    /// If the table_path contains one or more files (i.e. it is a directory /
+    /// prefix of files) their schema is merged by calling [`FileFormat::infer_schema`]
+    ///
+    /// Note: The inferred schema does not include any partitioning columns.
+    ///
+    /// This method is called as part of creating a [`ListingTable`].
     pub async fn infer_schema<'a>(
         &'a self,
         state: &dyn Session,
@@ -656,16 +729,14 @@ impl ListingOptions {
 /// `ListingTable` also supports limit, filter and projection pushdown for formats that
 /// support it as such as Parquet.
 ///
-/// # Implementation
+/// # See Also
 ///
-/// `ListingTable` Uses [`DataSourceExec`] to execute the data. See that struct
-/// for more details.
+/// 1. [`ListingTableConfig`]: Configuration options
+/// 1. [`DataSourceExec`]: `ExecutionPlan` used by `ListingTable`
 ///
 /// [`DataSourceExec`]: crate::datasource::source::DataSourceExec
 ///
-/// # Example
-///
-/// To read a directory of parquet files using a [`ListingTable`]:
+/// # Example: Read a directory of parquet files using a [`ListingTable`]
 ///
 /// ```no_run
 /// # use datafusion::prelude::SessionContext;
@@ -712,7 +783,7 @@ impl ListingOptions {
 /// # Ok(())
 /// # }
 /// ```
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ListingTable {
     table_paths: Vec<ListingTableUrl>,
     /// `file_schema` contains only the columns physically stored in the data files themselves.
@@ -723,6 +794,8 @@ pub struct ListingTable {
     ///     - Partition columns are derived from directory paths (not stored in files)
     ///     - These are columns like "year=2022/month=01" in paths like `/data/year=2022/month=01/file.parquet`
     table_schema: SchemaRef,
+    /// Indicates how the schema was derived (inferred or explicitly specified)
+    schema_source: SchemaSource,
     options: ListingOptions,
     definition: Option<String>,
     collected_statistics: FileStatisticsCache,
@@ -731,17 +804,13 @@ pub struct ListingTable {
 }
 
 impl ListingTable {
-    /// Create new [`ListingTable`] that lists the FS to get the files
-    /// to scan. See [`ListingTable`] for and example.
+    /// Create new [`ListingTable`]
     ///
-    /// Takes a `ListingTableConfig` as input which requires an `ObjectStore` and `table_path`.
-    /// `ListingOptions` and `SchemaRef` are optional.  If they are not
-    /// provided the file type is inferred based on the file suffix.
-    /// If the schema is provided then it must be resolved before creating the table
-    /// and should contain the fields of the file without the table
-    /// partitioning columns.
-    ///
+    /// See documentation and example on [`ListingTable`] and [`ListingTableConfig`]
     pub fn try_new(config: ListingTableConfig) -> Result<Self> {
+        // Extract schema_source before moving other parts of the config
+        let schema_source = config.schema_source();
+
         let file_schema = config
             .file_schema
             .ok_or_else(|| DataFusionError::Internal("No schema provided.".into()))?;
@@ -766,10 +835,11 @@ impl ListingTable {
             table_paths: config.table_paths,
             file_schema,
             table_schema,
+            schema_source,
             options,
             definition: None,
             collected_statistics: Arc::new(DefaultFileStatisticsCache::default()),
-            constraints: Constraints::empty(),
+            constraints: Constraints::default(),
             column_defaults: HashMap::new(),
         };
 
@@ -799,7 +869,7 @@ impl ListingTable {
     /// If `None`, creates a new [`DefaultFileStatisticsCache`] scoped to this query.
     pub fn with_cache(mut self, cache: Option<FileStatisticsCache>) -> Self {
         self.collected_statistics =
-            cache.unwrap_or(Arc::new(DefaultFileStatisticsCache::default()));
+            cache.unwrap_or_else(|| Arc::new(DefaultFileStatisticsCache::default()));
         self
     }
 
@@ -817,6 +887,11 @@ impl ListingTable {
     /// Get options ref
     pub fn options(&self) -> &ListingOptions {
         &self.options
+    }
+
+    /// Get the schema source
+    pub fn schema_source(&self) -> SchemaSource {
+        self.schema_source
     }
 
     /// If file_sort_order is specified, creates the appropriate physical expressions
@@ -921,19 +996,6 @@ impl TableProvider for ListingTable {
             None => {} // no ordering required
         };
 
-        let filters = match conjunction(filters.to_vec()) {
-            Some(expr) => {
-                let table_df_schema = self.table_schema.as_ref().clone().to_dfschema()?;
-                let filters = create_physical_expr(
-                    &expr,
-                    &table_df_schema,
-                    state.execution_props(),
-                )?;
-                Some(filters)
-            }
-            None => None,
-        };
-
         let Some(object_store_url) =
             self.table_paths.first().map(ListingTableUrl::object_store)
         else {
@@ -958,7 +1020,6 @@ impl TableProvider for ListingTable {
                 .with_output_ordering(output_ordering)
                 .with_table_partition_cols(table_partition_cols)
                 .build(),
-                filters.as_ref(),
             )
             .await
     }
@@ -979,18 +1040,6 @@ impl TableProvider for ListingTable {
                 if can_be_evaluted_for_partition_pruning(&partition_column_names, filter)
                 {
                     // if filter can be handled by partition pruning, it is exact
-                    return Ok(TableProviderFilterPushDown::Exact);
-                }
-
-                // if we can't push it down completely with only the filename-based/path-based
-                // column names, then we should check if we can do parquet predicate pushdown
-                let supports_pushdown = self.options.format.supports_filters_pushdown(
-                    &self.file_schema,
-                    &self.table_schema,
-                    &[filter],
-                )?;
-
-                if supports_pushdown == FilePushdownSupport::Supported {
                     return Ok(TableProviderFilterPushDown::Exact);
                 }
 
@@ -1051,25 +1100,9 @@ impl TableProvider for ListingTable {
             file_extension: self.options().format.get_ext(),
         };
 
-        let order_requirements = if !self.options().file_sort_order.is_empty() {
-            // Multiple sort orders in outer vec are equivalent, so we pass only the first one
-            let orderings = self.try_create_output_ordering()?;
-            let Some(ordering) = orderings.first() else {
-                return internal_err!(
-                    "Expected ListingTable to have a sort order, but none found!"
-                );
-            };
-            // Converts Vec<Vec<SortExpr>> into type required by execution plan to specify its required input ordering
-            Some(LexRequirement::new(
-                ordering
-                    .into_iter()
-                    .cloned()
-                    .map(PhysicalSortRequirement::from)
-                    .collect::<Vec<_>>(),
-            ))
-        } else {
-            None
-        };
+        let orderings = self.try_create_output_ordering()?;
+        // It is sufficient to pass only one of the equivalent orderings:
+        let order_requirements = orderings.into_iter().next().map(Into::into);
 
         self.options()
             .format
@@ -1130,12 +1163,24 @@ impl ListingTable {
             get_files_with_limit(files, limit, self.options.collect_stat).await?;
 
         let file_groups = file_group.split_files(self.options.target_partitions);
-        compute_all_files_statistics(
+        let (mut file_groups, mut stats) = compute_all_files_statistics(
             file_groups,
             self.schema(),
             self.options.collect_stat,
             inexact_stats,
-        )
+        )?;
+        let (schema_mapper, _) = DefaultSchemaAdapterFactory::from_schema(self.schema())
+            .map_schema(self.file_schema.as_ref())?;
+        stats.column_statistics =
+            schema_mapper.map_column_statistics(&stats.column_statistics)?;
+        file_groups.iter_mut().try_for_each(|file_group| {
+            if let Some(stat) = file_group.statistics_mut() {
+                stat.column_statistics =
+                    schema_mapper.map_column_statistics(&stat.column_statistics)?;
+            }
+            Ok::<_, DataFusionError>(())
+        })?;
+        Ok((file_groups, stats))
     }
 
     /// Collects statistics for a given partitioned file.
@@ -1256,32 +1301,119 @@ async fn get_files_with_limit(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::datasource::file_format::csv::CsvFormat;
-    use crate::datasource::file_format::json::JsonFormat;
     #[cfg(feature = "parquet")]
     use crate::datasource::file_format::parquet::ParquetFormat;
-    use crate::datasource::{provider_as_source, DefaultTableSource, MemTable};
-    use crate::execution::options::ArrowReadOptions;
     use crate::prelude::*;
-    use crate::test::{columns, object_store::register_test_store};
-
-    use arrow::compute::SortOptions;
-    use arrow::record_batch::RecordBatch;
-    use datafusion_common::stats::Precision;
-    use datafusion_common::test_util::batches_to_string;
-    use datafusion_common::{assert_contains, ScalarValue};
+    use crate::{
+        datasource::{
+            file_format::csv::CsvFormat, file_format::json::JsonFormat,
+            provider_as_source, DefaultTableSource, MemTable,
+        },
+        execution::options::ArrowReadOptions,
+        test::{
+            columns, object_store::ensure_head_concurrency,
+            object_store::make_test_store_and_state, object_store::register_test_store,
+        },
+    };
+    use arrow::{compute::SortOptions, record_batch::RecordBatch};
+    use datafusion_common::{
+        assert_contains,
+        stats::Precision,
+        test_util::{batches_to_string, datafusion_test_data},
+        ScalarValue,
+    };
     use datafusion_expr::{BinaryExpr, LogicalPlanBuilder, Operator};
     use datafusion_physical_expr::PhysicalSortExpr;
-    use datafusion_physical_plan::collect;
-    use datafusion_physical_plan::ExecutionPlanProperties;
-
-    use crate::test::object_store::{ensure_head_concurrency, make_test_store_and_state};
+    use datafusion_physical_plan::{collect, ExecutionPlanProperties};
+    use std::io::Write;
     use tempfile::TempDir;
     use url::Url;
 
+    /// Creates a test schema with standard field types used in tests
+    fn create_test_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("c1", DataType::Float32, true),
+            Field::new("c2", DataType::Float64, true),
+            Field::new("c3", DataType::Boolean, true),
+            Field::new("c4", DataType::Utf8, true),
+        ]))
+    }
+
+    /// Helper function to generate test file paths with given prefix, count, and optional start index
+    fn generate_test_files(prefix: &str, count: usize) -> Vec<String> {
+        generate_test_files_with_start(prefix, count, 0)
+    }
+
+    /// Helper function to generate test file paths with given prefix, count, and start index
+    fn generate_test_files_with_start(
+        prefix: &str,
+        count: usize,
+        start_index: usize,
+    ) -> Vec<String> {
+        (start_index..start_index + count)
+            .map(|i| format!("{prefix}/file{i}"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_schema_source_tracking_comprehensive() -> Result<()> {
+        let ctx = SessionContext::new();
+        let testdata = datafusion_test_data();
+        let filename = format!("{testdata}/aggregate_simple.csv");
+        let table_path = ListingTableUrl::parse(filename).unwrap();
+
+        // Test default schema source
+        let config = ListingTableConfig::new(table_path.clone());
+        assert_eq!(config.schema_source(), SchemaSource::None);
+
+        // Test schema source after setting a schema explicitly
+        let provided_schema = create_test_schema();
+        let config_with_schema = config.clone().with_schema(provided_schema.clone());
+        assert_eq!(config_with_schema.schema_source(), SchemaSource::Specified);
+
+        // Test schema source after inferring schema
+        let format = CsvFormat::default();
+        let options = ListingOptions::new(Arc::new(format));
+        let config_with_options = config.with_listing_options(options.clone());
+        assert_eq!(config_with_options.schema_source(), SchemaSource::None);
+
+        let config_with_inferred = config_with_options.infer_schema(&ctx.state()).await?;
+        assert_eq!(config_with_inferred.schema_source(), SchemaSource::Inferred);
+
+        // Test schema preservation through operations
+        let config_with_schema_and_options = config_with_schema
+            .clone()
+            .with_listing_options(options.clone());
+        assert_eq!(
+            config_with_schema_and_options.schema_source(),
+            SchemaSource::Specified
+        );
+
+        // Make sure inferred schema doesn't override specified schema
+        let config_with_schema_and_infer = config_with_schema_and_options
+            .clone()
+            .infer(&ctx.state())
+            .await?;
+        assert_eq!(
+            config_with_schema_and_infer.schema_source(),
+            SchemaSource::Specified
+        );
+
+        // Verify sources in actual ListingTable objects
+        let table_specified = ListingTable::try_new(config_with_schema_and_options)?;
+        assert_eq!(table_specified.schema_source(), SchemaSource::Specified);
+
+        let table_inferred = ListingTable::try_new(config_with_inferred)?;
+        assert_eq!(table_inferred.schema_source(), SchemaSource::Inferred);
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn read_single_file() -> Result<()> {
-        let ctx = SessionContext::new();
+        let ctx = SessionContext::new_with_config(
+            SessionConfig::new().with_collect_statistics(true),
+        );
 
         let table = load_table(&ctx, "alltypes_plain.parquet").await?;
         let projection = None;
@@ -1294,62 +1426,14 @@ mod tests {
         assert_eq!(exec.output_partitioning().partition_count(), 1);
 
         // test metadata
-        assert_eq!(exec.statistics()?.num_rows, Precision::Exact(8));
-        assert_eq!(exec.statistics()?.total_byte_size, Precision::Exact(671));
-
-        Ok(())
-    }
-
-    #[cfg(feature = "parquet")]
-    #[tokio::test]
-    async fn load_table_stats_by_default() -> Result<()> {
-        use crate::datasource::file_format::parquet::ParquetFormat;
-
-        let testdata = crate::test_util::parquet_test_data();
-        let filename = format!("{}/{}", testdata, "alltypes_plain.parquet");
-        let table_path = ListingTableUrl::parse(filename).unwrap();
-
-        let ctx = SessionContext::new();
-        let state = ctx.state();
-
-        let opt = ListingOptions::new(Arc::new(ParquetFormat::default()));
-        let schema = opt.infer_schema(&state, &table_path).await?;
-        let config = ListingTableConfig::new(table_path)
-            .with_listing_options(opt)
-            .with_schema(schema);
-        let table = ListingTable::try_new(config)?;
-
-        let exec = table.scan(&state, None, &[], None).await?;
-        assert_eq!(exec.statistics()?.num_rows, Precision::Exact(8));
-        // TODO correct byte size: https://github.com/apache/datafusion/issues/14936
-        assert_eq!(exec.statistics()?.total_byte_size, Precision::Exact(671));
-
-        Ok(())
-    }
-
-    #[cfg(feature = "parquet")]
-    #[tokio::test]
-    async fn load_table_stats_when_no_stats() -> Result<()> {
-        use crate::datasource::file_format::parquet::ParquetFormat;
-
-        let testdata = crate::test_util::parquet_test_data();
-        let filename = format!("{}/{}", testdata, "alltypes_plain.parquet");
-        let table_path = ListingTableUrl::parse(filename).unwrap();
-
-        let ctx = SessionContext::new();
-        let state = ctx.state();
-
-        let opt = ListingOptions::new(Arc::new(ParquetFormat::default()))
-            .with_collect_stat(false);
-        let schema = opt.infer_schema(&state, &table_path).await?;
-        let config = ListingTableConfig::new(table_path)
-            .with_listing_options(opt)
-            .with_schema(schema);
-        let table = ListingTable::try_new(config)?;
-
-        let exec = table.scan(&state, None, &[], None).await?;
-        assert_eq!(exec.statistics()?.num_rows, Precision::Absent);
-        assert_eq!(exec.statistics()?.total_byte_size, Precision::Absent);
+        assert_eq!(
+            exec.partition_statistics(None)?.num_rows,
+            Precision::Exact(8)
+        );
+        assert_eq!(
+            exec.partition_statistics(None)?.total_byte_size,
+            Precision::Exact(671)
+        );
 
         Ok(())
     }
@@ -1372,7 +1456,7 @@ mod tests {
 
         // (file_sort_order, expected_result)
         let cases = vec![
-            (vec![], Ok(vec![])),
+            (vec![], Ok(Vec::<LexOrdering>::new())),
             // sort expr, but non column
             (
                 vec![vec![
@@ -1383,15 +1467,13 @@ mod tests {
             // ok with one column
             (
                 vec![vec![col("string_col").sort(true, false)]],
-                Ok(vec![LexOrdering::new(
-                        vec![PhysicalSortExpr {
+                Ok(vec![[PhysicalSortExpr {
                             expr: physical_col("string_col", &schema).unwrap(),
                             options: SortOptions {
                                 descending: false,
                                 nulls_first: false,
                             },
-                        }],
-                )
+                        }].into(),
                 ])
             ),
             // ok with two columns, different options
@@ -1400,16 +1482,14 @@ mod tests {
                     col("string_col").sort(true, false),
                     col("int_col").sort(false, true),
                 ]],
-                Ok(vec![LexOrdering::new(
-                        vec![
+                Ok(vec![[
                             PhysicalSortExpr::new_default(physical_col("string_col", &schema).unwrap())
                                         .asc()
                                         .nulls_last(),
                             PhysicalSortExpr::new_default(physical_col("int_col", &schema).unwrap())
                                         .desc()
                                         .nulls_first()
-                        ],
-                )
+                        ].into(),
                 ])
             ),
         ];
@@ -1485,263 +1565,6 @@ mod tests {
             vec!["a".to_owned(), "p1".to_owned()]
         );
 
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_assert_list_files_for_scan_grouping() -> Result<()> {
-        // more expected partitions than files
-        assert_list_files_for_scan_grouping(
-            &[
-                "bucket/key-prefix/file0",
-                "bucket/key-prefix/file1",
-                "bucket/key-prefix/file2",
-                "bucket/key-prefix/file3",
-                "bucket/key-prefix/file4",
-            ],
-            "test:///bucket/key-prefix/",
-            12,
-            5,
-            Some(""),
-        )
-        .await?;
-
-        // as many expected partitions as files
-        assert_list_files_for_scan_grouping(
-            &[
-                "bucket/key-prefix/file0",
-                "bucket/key-prefix/file1",
-                "bucket/key-prefix/file2",
-                "bucket/key-prefix/file3",
-            ],
-            "test:///bucket/key-prefix/",
-            4,
-            4,
-            Some(""),
-        )
-        .await?;
-
-        // more files as expected partitions
-        assert_list_files_for_scan_grouping(
-            &[
-                "bucket/key-prefix/file0",
-                "bucket/key-prefix/file1",
-                "bucket/key-prefix/file2",
-                "bucket/key-prefix/file3",
-                "bucket/key-prefix/file4",
-            ],
-            "test:///bucket/key-prefix/",
-            2,
-            2,
-            Some(""),
-        )
-        .await?;
-
-        // no files => no groups
-        assert_list_files_for_scan_grouping(
-            &[],
-            "test:///bucket/key-prefix/",
-            2,
-            0,
-            Some(""),
-        )
-        .await?;
-
-        // files that don't match the prefix
-        assert_list_files_for_scan_grouping(
-            &[
-                "bucket/key-prefix/file0",
-                "bucket/key-prefix/file1",
-                "bucket/other-prefix/roguefile",
-            ],
-            "test:///bucket/key-prefix/",
-            10,
-            2,
-            Some(""),
-        )
-        .await?;
-
-        // files that don't match the prefix or the default file extention
-        assert_list_files_for_scan_grouping(
-            &[
-                "bucket/key-prefix/file0.json",
-                "bucket/key-prefix/file1.parquet",
-                "bucket/other-prefix/roguefile.json",
-            ],
-            "test:///bucket/key-prefix/",
-            10,
-            1,
-            None,
-        )
-        .await?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_assert_list_files_for_multi_path() -> Result<()> {
-        // more expected partitions than files
-        assert_list_files_for_multi_paths(
-            &[
-                "bucket/key1/file0",
-                "bucket/key1/file1",
-                "bucket/key1/file2",
-                "bucket/key2/file3",
-                "bucket/key2/file4",
-                "bucket/key3/file5",
-            ],
-            &["test:///bucket/key1/", "test:///bucket/key2/"],
-            12,
-            5,
-            Some(""),
-        )
-        .await?;
-
-        // as many expected partitions as files
-        assert_list_files_for_multi_paths(
-            &[
-                "bucket/key1/file0",
-                "bucket/key1/file1",
-                "bucket/key1/file2",
-                "bucket/key2/file3",
-                "bucket/key2/file4",
-                "bucket/key3/file5",
-            ],
-            &["test:///bucket/key1/", "test:///bucket/key2/"],
-            5,
-            5,
-            Some(""),
-        )
-        .await?;
-
-        // more files as expected partitions
-        assert_list_files_for_multi_paths(
-            &[
-                "bucket/key1/file0",
-                "bucket/key1/file1",
-                "bucket/key1/file2",
-                "bucket/key2/file3",
-                "bucket/key2/file4",
-                "bucket/key3/file5",
-            ],
-            &["test:///bucket/key1/"],
-            2,
-            2,
-            Some(""),
-        )
-        .await?;
-
-        // no files => no groups
-        assert_list_files_for_multi_paths(&[], &["test:///bucket/key1/"], 2, 0, Some(""))
-            .await?;
-
-        // files that don't match the prefix
-        assert_list_files_for_multi_paths(
-            &[
-                "bucket/key1/file0",
-                "bucket/key1/file1",
-                "bucket/key1/file2",
-                "bucket/key2/file3",
-                "bucket/key2/file4",
-                "bucket/key3/file5",
-            ],
-            &["test:///bucket/key3/"],
-            2,
-            1,
-            Some(""),
-        )
-        .await?;
-
-        // files that don't match the prefix or the default file ext
-        assert_list_files_for_multi_paths(
-            &[
-                "bucket/key1/file0.json",
-                "bucket/key1/file1.csv",
-                "bucket/key1/file2.json",
-                "bucket/key2/file3.csv",
-                "bucket/key2/file4.json",
-                "bucket/key3/file5.csv",
-            ],
-            &["test:///bucket/key1/", "test:///bucket/key3/"],
-            2,
-            2,
-            None,
-        )
-        .await?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_assert_list_files_for_exact_paths() -> Result<()> {
-        // more expected partitions than files
-        assert_list_files_for_exact_paths(
-            &[
-                "bucket/key1/file0",
-                "bucket/key1/file1",
-                "bucket/key1/file2",
-                "bucket/key2/file3",
-                "bucket/key2/file4",
-            ],
-            12,
-            5,
-            Some(""),
-        )
-        .await?;
-
-        // more files than meta_fetch_concurrency (32)
-        let files: Vec<String> =
-            (0..64).map(|i| format!("bucket/key1/file{}", i)).collect();
-        // Collect references to each string
-        let file_refs: Vec<&str> = files.iter().map(|s| s.as_str()).collect();
-        assert_list_files_for_exact_paths(file_refs.as_slice(), 5, 5, Some("")).await?;
-
-        // as many expected partitions as files
-        assert_list_files_for_exact_paths(
-            &[
-                "bucket/key1/file0",
-                "bucket/key1/file1",
-                "bucket/key1/file2",
-                "bucket/key2/file3",
-                "bucket/key2/file4",
-            ],
-            5,
-            5,
-            Some(""),
-        )
-        .await?;
-
-        // more files as expected partitions
-        assert_list_files_for_exact_paths(
-            &[
-                "bucket/key1/file0",
-                "bucket/key1/file1",
-                "bucket/key1/file2",
-                "bucket/key2/file3",
-                "bucket/key2/file4",
-            ],
-            2,
-            2,
-            Some(""),
-        )
-        .await?;
-
-        // no files => no groups
-        assert_list_files_for_exact_paths(&[], 2, 0, Some("")).await?;
-
-        // files that don't match the default file ext
-        assert_list_files_for_exact_paths(
-            &[
-                "bucket/key1/file0.json",
-                "bucket/key1/file1.csv",
-                "bucket/key1/file2.json",
-                "bucket/key2/file3.csv",
-                "bucket/key2/file4.json",
-                "bucket/key3/file5.csv",
-            ],
-            2,
-            2,
-            None,
-        )
-        .await?;
         Ok(())
     }
 
@@ -1847,10 +1670,10 @@ mod tests {
             .execution
             .meta_fetch_concurrency;
         let expected_concurrency = files.len().min(meta_fetch_concurrency);
-        let head_blocking_store = ensure_head_concurrency(store, expected_concurrency);
+        let head_concurrency_store = ensure_head_concurrency(store, expected_concurrency);
 
         let url = Url::parse("test://").unwrap();
-        ctx.register_object_store(&url, head_blocking_store.clone());
+        ctx.register_object_store(&url, head_concurrency_store.clone());
 
         let format = JsonFormat::default();
 
@@ -1862,7 +1685,7 @@ mod tests {
 
         let table_paths = files
             .iter()
-            .map(|t| ListingTableUrl::parse(format!("test:///{}", t)).unwrap())
+            .map(|t| ListingTableUrl::parse(format!("test:///{t}")).unwrap())
             .collect();
         let config = ListingTableConfig::new_with_multi_paths(table_paths)
             .with_listing_options(opt)
@@ -1874,80 +1697,6 @@ mod tests {
 
         assert_eq!(file_list.len(), output_partitioning);
 
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_insert_into_append_new_json_files() -> Result<()> {
-        let mut config_map: HashMap<String, String> = HashMap::new();
-        config_map.insert("datafusion.execution.batch_size".into(), "10".into());
-        config_map.insert(
-            "datafusion.execution.soft_max_rows_per_output_file".into(),
-            "10".into(),
-        );
-        helper_test_append_new_files_to_table(
-            JsonFormat::default().get_ext(),
-            FileCompressionType::UNCOMPRESSED,
-            Some(config_map),
-            2,
-        )
-        .await?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_insert_into_append_new_csv_files() -> Result<()> {
-        let mut config_map: HashMap<String, String> = HashMap::new();
-        config_map.insert("datafusion.execution.batch_size".into(), "10".into());
-        config_map.insert(
-            "datafusion.execution.soft_max_rows_per_output_file".into(),
-            "10".into(),
-        );
-        helper_test_append_new_files_to_table(
-            CsvFormat::default().get_ext(),
-            FileCompressionType::UNCOMPRESSED,
-            Some(config_map),
-            2,
-        )
-        .await?;
-        Ok(())
-    }
-
-    #[cfg(feature = "parquet")]
-    #[tokio::test]
-    async fn test_insert_into_append_2_new_parquet_files_defaults() -> Result<()> {
-        let mut config_map: HashMap<String, String> = HashMap::new();
-        config_map.insert("datafusion.execution.batch_size".into(), "10".into());
-        config_map.insert(
-            "datafusion.execution.soft_max_rows_per_output_file".into(),
-            "10".into(),
-        );
-        helper_test_append_new_files_to_table(
-            ParquetFormat::default().get_ext(),
-            FileCompressionType::UNCOMPRESSED,
-            Some(config_map),
-            2,
-        )
-        .await?;
-        Ok(())
-    }
-
-    #[cfg(feature = "parquet")]
-    #[tokio::test]
-    async fn test_insert_into_append_1_new_parquet_files_defaults() -> Result<()> {
-        let mut config_map: HashMap<String, String> = HashMap::new();
-        config_map.insert("datafusion.execution.batch_size".into(), "20".into());
-        config_map.insert(
-            "datafusion.execution.soft_max_rows_per_output_file".into(),
-            "20".into(),
-        );
-        helper_test_append_new_files_to_table(
-            ParquetFormat::default().get_ext(),
-            FileCompressionType::UNCOMPRESSED,
-            Some(config_map),
-            1,
-        )
-        .await?;
         Ok(())
     }
 
@@ -2183,7 +1932,7 @@ mod tests {
         let filter_predicate = Expr::BinaryExpr(BinaryExpr::new(
             Box::new(Expr::Column("column1".into())),
             Operator::GtEq,
-            Box::new(Expr::Literal(ScalarValue::Int32(Some(0)))),
+            Box::new(Expr::Literal(ScalarValue::Int32(Some(0)), None)),
         ));
 
         // Create a new batch of data to insert into the table
@@ -2367,8 +2116,10 @@ mod tests {
 
         // create table
         let tmp_dir = TempDir::new()?;
-        let tmp_path = tmp_dir.into_path();
-        let str_path = tmp_path.to_str().expect("Temp path should convert to &str");
+        let str_path = tmp_dir
+            .path()
+            .to_str()
+            .expect("Temp path should convert to &str");
         session_ctx
             .sql(&format!(
                 "create external table foo(a varchar, b varchar, c int) \
@@ -2409,7 +2160,7 @@ mod tests {
     #[tokio::test]
     async fn test_infer_options_compressed_csv() -> Result<()> {
         let testdata = crate::test_util::arrow_test_data();
-        let filename = format!("{}/csv/aggregate_test_100.csv.gz", testdata);
+        let filename = format!("{testdata}/csv/aggregate_test_100.csv.gz");
         let table_path = ListingTableUrl::parse(filename).unwrap();
 
         let ctx = SessionContext::new();
@@ -2421,6 +2172,384 @@ mod tests {
         let schema = config_with_schema.file_schema.unwrap();
 
         assert_eq!(schema.fields.len(), 13);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn infer_preserves_provided_schema() -> Result<()> {
+        let ctx = SessionContext::new();
+
+        let testdata = datafusion_test_data();
+        let filename = format!("{testdata}/aggregate_simple.csv");
+        let table_path = ListingTableUrl::parse(filename).unwrap();
+
+        let provided_schema = create_test_schema();
+
+        let config =
+            ListingTableConfig::new(table_path).with_schema(Arc::clone(&provided_schema));
+
+        let config = config.infer(&ctx.state()).await?;
+
+        assert_eq!(*config.file_schema.unwrap(), *provided_schema);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_listing_table_config_with_multiple_files_comprehensive() -> Result<()> {
+        let ctx = SessionContext::new();
+
+        // Create test files with different schemas
+        let tmp_dir = TempDir::new()?;
+        let file_path1 = tmp_dir.path().join("file1.csv");
+        let file_path2 = tmp_dir.path().join("file2.csv");
+
+        // File 1: c1,c2,c3
+        let mut file1 = std::fs::File::create(&file_path1)?;
+        writeln!(file1, "c1,c2,c3")?;
+        writeln!(file1, "1,2,3")?;
+        writeln!(file1, "4,5,6")?;
+
+        // File 2: c1,c2,c3,c4
+        let mut file2 = std::fs::File::create(&file_path2)?;
+        writeln!(file2, "c1,c2,c3,c4")?;
+        writeln!(file2, "7,8,9,10")?;
+        writeln!(file2, "11,12,13,14")?;
+
+        // Parse paths
+        let table_path1 = ListingTableUrl::parse(file_path1.to_str().unwrap())?;
+        let table_path2 = ListingTableUrl::parse(file_path2.to_str().unwrap())?;
+
+        // Create format and options
+        let format = CsvFormat::default().with_has_header(true);
+        let options = ListingOptions::new(Arc::new(format));
+
+        // Test case 1: Infer schema using first file's schema
+        let config1 = ListingTableConfig::new_with_multi_paths(vec![
+            table_path1.clone(),
+            table_path2.clone(),
+        ])
+        .with_listing_options(options.clone());
+        let config1 = config1.infer_schema(&ctx.state()).await?;
+        assert_eq!(config1.schema_source(), SchemaSource::Inferred);
+
+        // Verify schema matches first file
+        let schema1 = config1.file_schema.as_ref().unwrap().clone();
+        assert_eq!(schema1.fields().len(), 3);
+        assert_eq!(schema1.field(0).name(), "c1");
+        assert_eq!(schema1.field(1).name(), "c2");
+        assert_eq!(schema1.field(2).name(), "c3");
+
+        // Test case 2: Use specified schema with 3 columns
+        let schema_3cols = Arc::new(Schema::new(vec![
+            Field::new("c1", DataType::Utf8, true),
+            Field::new("c2", DataType::Utf8, true),
+            Field::new("c3", DataType::Utf8, true),
+        ]));
+
+        let config2 = ListingTableConfig::new_with_multi_paths(vec![
+            table_path1.clone(),
+            table_path2.clone(),
+        ])
+        .with_schema(schema_3cols)
+        .with_listing_options(options.clone());
+        let config2 = config2.infer_schema(&ctx.state()).await?;
+        assert_eq!(config2.schema_source(), SchemaSource::Specified);
+
+        // Verify that the schema is still the one we specified (3 columns)
+        let schema2 = config2.file_schema.as_ref().unwrap().clone();
+        assert_eq!(schema2.fields().len(), 3);
+        assert_eq!(schema2.field(0).name(), "c1");
+        assert_eq!(schema2.field(1).name(), "c2");
+        assert_eq!(schema2.field(2).name(), "c3");
+
+        // Test case 3: Use specified schema with 4 columns
+        let schema_4cols = Arc::new(Schema::new(vec![
+            Field::new("c1", DataType::Utf8, true),
+            Field::new("c2", DataType::Utf8, true),
+            Field::new("c3", DataType::Utf8, true),
+            Field::new("c4", DataType::Utf8, true),
+        ]));
+
+        let config3 = ListingTableConfig::new_with_multi_paths(vec![
+            table_path1.clone(),
+            table_path2.clone(),
+        ])
+        .with_schema(schema_4cols)
+        .with_listing_options(options.clone());
+        let config3 = config3.infer_schema(&ctx.state()).await?;
+        assert_eq!(config3.schema_source(), SchemaSource::Specified);
+
+        // Verify that the schema is still the one we specified (4 columns)
+        let schema3 = config3.file_schema.as_ref().unwrap().clone();
+        assert_eq!(schema3.fields().len(), 4);
+        assert_eq!(schema3.field(0).name(), "c1");
+        assert_eq!(schema3.field(1).name(), "c2");
+        assert_eq!(schema3.field(2).name(), "c3");
+        assert_eq!(schema3.field(3).name(), "c4");
+
+        // Test case 4: Verify order matters when inferring schema
+        let config4 = ListingTableConfig::new_with_multi_paths(vec![
+            table_path2.clone(),
+            table_path1.clone(),
+        ])
+        .with_listing_options(options);
+        let config4 = config4.infer_schema(&ctx.state()).await?;
+
+        // Should use first file's schema, which now has 4 columns
+        let schema4 = config4.file_schema.as_ref().unwrap().clone();
+        assert_eq!(schema4.fields().len(), 4);
+        assert_eq!(schema4.field(0).name(), "c1");
+        assert_eq!(schema4.field(1).name(), "c2");
+        assert_eq!(schema4.field(2).name(), "c3");
+        assert_eq!(schema4.field(3).name(), "c4");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_list_files_configurations() -> Result<()> {
+        // Define common test cases as (description, files, paths, target_partitions, expected_partitions, file_ext)
+        let test_cases = vec![
+            // Single path cases
+            (
+                "Single path, more partitions than files",
+                generate_test_files("bucket/key-prefix", 5),
+                vec!["test:///bucket/key-prefix/"],
+                12,
+                5,
+                Some(""),
+            ),
+            (
+                "Single path, equal partitions and files",
+                generate_test_files("bucket/key-prefix", 4),
+                vec!["test:///bucket/key-prefix/"],
+                4,
+                4,
+                Some(""),
+            ),
+            (
+                "Single path, more files than partitions",
+                generate_test_files("bucket/key-prefix", 5),
+                vec!["test:///bucket/key-prefix/"],
+                2,
+                2,
+                Some(""),
+            ),
+            // Multi path cases
+            (
+                "Multi path, more partitions than files",
+                {
+                    let mut files = generate_test_files("bucket/key1", 3);
+                    files.extend(generate_test_files_with_start("bucket/key2", 2, 3));
+                    files.extend(generate_test_files_with_start("bucket/key3", 1, 5));
+                    files
+                },
+                vec!["test:///bucket/key1/", "test:///bucket/key2/"],
+                12,
+                5,
+                Some(""),
+            ),
+            // No files case
+            (
+                "No files",
+                vec![],
+                vec!["test:///bucket/key-prefix/"],
+                2,
+                0,
+                Some(""),
+            ),
+            // Exact path cases
+            (
+                "Exact paths test",
+                {
+                    let mut files = generate_test_files("bucket/key1", 3);
+                    files.extend(generate_test_files_with_start("bucket/key2", 2, 3));
+                    files
+                },
+                vec![
+                    "test:///bucket/key1/file0",
+                    "test:///bucket/key1/file1",
+                    "test:///bucket/key1/file2",
+                    "test:///bucket/key2/file3",
+                    "test:///bucket/key2/file4",
+                ],
+                12,
+                5,
+                Some(""),
+            ),
+        ];
+
+        // Run each test case
+        for (test_name, files, paths, target_partitions, expected_partitions, file_ext) in
+            test_cases
+        {
+            println!("Running test: {test_name}");
+
+            if files.is_empty() {
+                // Test empty files case
+                assert_list_files_for_multi_paths(
+                    &[],
+                    &paths,
+                    target_partitions,
+                    expected_partitions,
+                    file_ext,
+                )
+                .await?;
+            } else if paths.len() == 1 {
+                // Test using single path API
+                let file_refs: Vec<&str> = files.iter().map(|s| s.as_str()).collect();
+                assert_list_files_for_scan_grouping(
+                    &file_refs,
+                    paths[0],
+                    target_partitions,
+                    expected_partitions,
+                    file_ext,
+                )
+                .await?;
+            } else if paths[0].contains("test:///bucket/key") {
+                // Test using multi path API
+                let file_refs: Vec<&str> = files.iter().map(|s| s.as_str()).collect();
+                assert_list_files_for_multi_paths(
+                    &file_refs,
+                    &paths,
+                    target_partitions,
+                    expected_partitions,
+                    file_ext,
+                )
+                .await?;
+            } else {
+                // Test using exact path API for specific cases
+                let file_refs: Vec<&str> = files.iter().map(|s| s.as_str()).collect();
+                assert_list_files_for_exact_paths(
+                    &file_refs,
+                    target_partitions,
+                    expected_partitions,
+                    file_ext,
+                )
+                .await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(feature = "parquet")]
+    #[tokio::test]
+    async fn test_table_stats_behaviors() -> Result<()> {
+        use crate::datasource::file_format::parquet::ParquetFormat;
+
+        let testdata = crate::test_util::parquet_test_data();
+        let filename = format!("{}/{}", testdata, "alltypes_plain.parquet");
+        let table_path = ListingTableUrl::parse(filename).unwrap();
+
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+
+        // Test 1: Default behavior - stats not collected
+        let opt_default = ListingOptions::new(Arc::new(ParquetFormat::default()));
+        let schema_default = opt_default.infer_schema(&state, &table_path).await?;
+        let config_default = ListingTableConfig::new(table_path.clone())
+            .with_listing_options(opt_default)
+            .with_schema(schema_default);
+        let table_default = ListingTable::try_new(config_default)?;
+
+        let exec_default = table_default.scan(&state, None, &[], None).await?;
+        assert_eq!(
+            exec_default.partition_statistics(None)?.num_rows,
+            Precision::Absent
+        );
+
+        // TODO correct byte size: https://github.com/apache/datafusion/issues/14936
+        assert_eq!(
+            exec_default.partition_statistics(None)?.total_byte_size,
+            Precision::Absent
+        );
+
+        // Test 2: Explicitly disable stats
+        let opt_disabled = ListingOptions::new(Arc::new(ParquetFormat::default()))
+            .with_collect_stat(false);
+        let schema_disabled = opt_disabled.infer_schema(&state, &table_path).await?;
+        let config_disabled = ListingTableConfig::new(table_path.clone())
+            .with_listing_options(opt_disabled)
+            .with_schema(schema_disabled);
+        let table_disabled = ListingTable::try_new(config_disabled)?;
+
+        let exec_disabled = table_disabled.scan(&state, None, &[], None).await?;
+        assert_eq!(
+            exec_disabled.partition_statistics(None)?.num_rows,
+            Precision::Absent
+        );
+        assert_eq!(
+            exec_disabled.partition_statistics(None)?.total_byte_size,
+            Precision::Absent
+        );
+
+        // Test 3: Explicitly enable stats
+        let opt_enabled = ListingOptions::new(Arc::new(ParquetFormat::default()))
+            .with_collect_stat(true);
+        let schema_enabled = opt_enabled.infer_schema(&state, &table_path).await?;
+        let config_enabled = ListingTableConfig::new(table_path)
+            .with_listing_options(opt_enabled)
+            .with_schema(schema_enabled);
+        let table_enabled = ListingTable::try_new(config_enabled)?;
+
+        let exec_enabled = table_enabled.scan(&state, None, &[], None).await?;
+        assert_eq!(
+            exec_enabled.partition_statistics(None)?.num_rows,
+            Precision::Exact(8)
+        );
+        // TODO correct byte size: https://github.com/apache/datafusion/issues/14936
+        assert_eq!(
+            exec_enabled.partition_statistics(None)?.total_byte_size,
+            Precision::Exact(671)
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_insert_into_parameterized() -> Result<()> {
+        let test_cases = vec![
+            // (file_format, batch_size, soft_max_rows, expected_files)
+            ("json", 10, 10, 2),
+            ("csv", 10, 10, 2),
+            #[cfg(feature = "parquet")]
+            ("parquet", 10, 10, 2),
+            #[cfg(feature = "parquet")]
+            ("parquet", 20, 20, 1),
+        ];
+
+        for (format, batch_size, soft_max_rows, expected_files) in test_cases {
+            println!("Testing insert with format: {format}, batch_size: {batch_size}, expected files: {expected_files}");
+
+            let mut config_map = HashMap::new();
+            config_map.insert(
+                "datafusion.execution.batch_size".into(),
+                batch_size.to_string(),
+            );
+            config_map.insert(
+                "datafusion.execution.soft_max_rows_per_output_file".into(),
+                soft_max_rows.to_string(),
+            );
+
+            let file_extension = match format {
+                "json" => JsonFormat::default().get_ext(),
+                "csv" => CsvFormat::default().get_ext(),
+                #[cfg(feature = "parquet")]
+                "parquet" => ParquetFormat::default().get_ext(),
+                _ => unreachable!("Unsupported format"),
+            };
+
+            helper_test_append_new_files_to_table(
+                file_extension,
+                FileCompressionType::UNCOMPRESSED,
+                Some(config_map),
+                expected_files,
+            )
+            .await?;
+        }
 
         Ok(())
     }

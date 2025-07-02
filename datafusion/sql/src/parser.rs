@@ -39,9 +39,14 @@ use std::fmt;
 
 // Use `Parser::expected` instead, if possible
 macro_rules! parser_err {
-    ($MSG:expr) => {
-        Err(ParserError::ParserError($MSG.to_string()))
-    };
+    ($MSG:expr $(; diagnostic = $DIAG:expr)?) => {{
+
+        let err = DataFusionError::from(ParserError::ParserError($MSG.to_string()));
+        $(
+            let err = err.with_diagnostic($DIAG);
+        )?
+        Err(err)
+    }};
 }
 
 fn parse_file_type(s: &str) -> Result<String, DataFusionError> {
@@ -142,7 +147,7 @@ impl fmt::Display for CopyToStatement {
 
         write!(f, "COPY {source} TO {target}")?;
         if let Some(file_type) = stored_as {
-            write!(f, " STORED AS {}", file_type)?;
+            write!(f, " STORED AS {file_type}")?;
         }
         if !partitioned_by.is_empty() {
             write!(f, " PARTITIONED BY ({})", partitioned_by.join(", "))?;
@@ -448,20 +453,16 @@ impl<'a> DFParser<'a> {
         found: TokenWithSpan,
     ) -> Result<T, DataFusionError> {
         let sql_parser_span = found.span;
-        parser_err!(format!(
-            "Expected: {expected}, found: {found}{}",
-            found.span.start
-        ))
-        .map_err(|e| {
-            let e = DataFusionError::from(e);
-            let span = Span::try_from_sqlparser_span(sql_parser_span);
-            let diagnostic = Diagnostic::new_error(
-                format!("Expected: {expected}, found: {found}{}", found.span.start),
-                span,
-            );
-
-            e.with_diagnostic(diagnostic)
-        })
+        let span = Span::try_from_sqlparser_span(sql_parser_span);
+        let diagnostic = Diagnostic::new_error(
+            format!("Expected: {expected}, found: {found}{}", found.span.start),
+            span,
+        );
+        parser_err!(
+            format!("Expected: {expected}, found: {found}{}", found.span.start);
+            diagnostic=
+            diagnostic
+        )
     }
 
     /// Parse a new expression

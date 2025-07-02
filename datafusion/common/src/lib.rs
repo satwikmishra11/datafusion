@@ -46,7 +46,10 @@ pub mod file_options;
 pub mod format;
 pub mod hash_utils;
 pub mod instant;
+pub mod nested_struct;
+mod null_equality;
 pub mod parsers;
+pub mod pruning;
 pub mod rounding;
 pub mod scalar;
 pub mod spans;
@@ -78,6 +81,7 @@ pub use functional_dependencies::{
 };
 use hashbrown::hash_map::DefaultHashBuilder;
 pub use join_type::{JoinConstraint, JoinSide, JoinType};
+pub use null_equality::NullEquality;
 pub use param_value::ParamValues;
 pub use scalar::{ScalarType, ScalarValue};
 pub use schema_reference::SchemaReference;
@@ -185,9 +189,7 @@ mod tests {
         let expected_prefix = expected_prefix.as_ref();
         assert!(
             actual.starts_with(expected_prefix),
-            "Expected '{}' to start with '{}'",
-            actual,
-            expected_prefix
+            "Expected '{actual}' to start with '{expected_prefix}'"
         );
     }
 }

@@ -32,7 +32,6 @@ use std::mem::{size_of, size_of_val};
 use std::str::FromStr;
 use std::sync::Arc;
 
-use crate::arrow_datafusion_err;
 use crate::cast::{
     as_decimal128_array, as_decimal256_array, as_dictionary_array,
     as_fixed_size_binary_array, as_fixed_size_list_array,
@@ -41,6 +40,7 @@ use crate::error::{DataFusionError, Result, _exec_err, _internal_err, _not_impl_
 use crate::format::DEFAULT_CAST_OPTIONS;
 use crate::hash_utils::create_hashes;
 use crate::utils::SingleRowListArrayBuilder;
+use crate::{_internal_datafusion_err, arrow_datafusion_err};
 use arrow::array::{
     types::{IntervalDayTime, IntervalMonthDayNano},
     *,
@@ -52,13 +52,14 @@ use arrow::compute::kernels::{
 };
 use arrow::datatypes::{
     i256, ArrowDictionaryKeyType, ArrowNativeType, ArrowTimestampType, DataType,
-    Date32Type, Date64Type, Field, Float32Type, Int16Type, Int32Type, Int64Type,
-    Int8Type, IntervalDayTimeType, IntervalMonthDayNanoType, IntervalUnit,
-    IntervalYearMonthType, TimeUnit, TimestampMicrosecondType, TimestampMillisecondType,
+    Date32Type, Field, Float32Type, Int16Type, Int32Type, Int64Type, Int8Type,
+    IntervalDayTimeType, IntervalMonthDayNanoType, IntervalUnit, IntervalYearMonthType,
+    TimeUnit, TimestampMicrosecondType, TimestampMillisecondType,
     TimestampNanosecondType, TimestampSecondType, UInt16Type, UInt32Type, UInt64Type,
     UInt8Type, UnionFields, UnionMode, DECIMAL128_MAX_PRECISION,
 };
 use arrow::util::display::{array_value_to_string, ArrayFormatter, FormatOptions};
+use chrono::{Duration, NaiveDate};
 use half::f16;
 pub use struct_builder::ScalarStructBuilder;
 
@@ -506,7 +507,7 @@ impl PartialOrd for ScalarValue {
             }
             (List(_), _) | (LargeList(_), _) | (FixedSizeList(_), _) => None,
             (Struct(struct_arr1), Struct(struct_arr2)) => {
-                partial_cmp_struct(struct_arr1, struct_arr2)
+                partial_cmp_struct(struct_arr1.as_ref(), struct_arr2.as_ref())
             }
             (Struct(_), _) => None,
             (Map(map_arr1), Map(map_arr2)) => partial_cmp_map(map_arr1, map_arr2),
@@ -597,10 +598,28 @@ fn partial_cmp_list(arr1: &dyn Array, arr2: &dyn Array) -> Option<Ordering> {
     let arr1 = first_array_for_list(arr1);
     let arr2 = first_array_for_list(arr2);
 
-    let lt_res = arrow::compute::kernels::cmp::lt(&arr1, &arr2).ok()?;
-    let eq_res = arrow::compute::kernels::cmp::eq(&arr1, &arr2).ok()?;
+    let min_length = arr1.len().min(arr2.len());
+    let arr1_trimmed = arr1.slice(0, min_length);
+    let arr2_trimmed = arr2.slice(0, min_length);
+
+    let lt_res = arrow::compute::kernels::cmp::lt(&arr1_trimmed, &arr2_trimmed).ok()?;
+    let eq_res = arrow::compute::kernels::cmp::eq(&arr1_trimmed, &arr2_trimmed).ok()?;
 
     for j in 0..lt_res.len() {
+        // In Postgres, NULL values in lists are always considered to be greater than non-NULL values:
+        //
+        // $ SELECT ARRAY[NULL]::integer[] > ARRAY[1]
+        // true
+        //
+        // These next two if statements are introduced for replicating Postgres behavior, as
+        // arrow::compute does not account for this.
+        if arr1_trimmed.is_null(j) && !arr2_trimmed.is_null(j) {
+            return Some(Ordering::Greater);
+        }
+        if !arr1_trimmed.is_null(j) && arr2_trimmed.is_null(j) {
+            return Some(Ordering::Less);
+        }
+
         if lt_res.is_valid(j) && lt_res.value(j) {
             return Some(Ordering::Less);
         }
@@ -609,10 +628,23 @@ fn partial_cmp_list(arr1: &dyn Array, arr2: &dyn Array) -> Option<Ordering> {
         }
     }
 
-    Some(Ordering::Equal)
+    Some(arr1.len().cmp(&arr2.len()))
 }
 
-fn partial_cmp_struct(s1: &Arc<StructArray>, s2: &Arc<StructArray>) -> Option<Ordering> {
+fn flatten<'a>(array: &'a StructArray, columns: &mut Vec<&'a ArrayRef>) {
+    for i in 0..array.num_columns() {
+        let column = array.column(i);
+        if let Some(nested_struct) = column.as_any().downcast_ref::<StructArray>() {
+            // If it's a nested struct, recursively expand
+            flatten(nested_struct, columns);
+        } else {
+            // If it's a primitive type, add directly
+            columns.push(column);
+        }
+    }
+}
+
+pub fn partial_cmp_struct(s1: &StructArray, s2: &StructArray) -> Option<Ordering> {
     if s1.len() != s2.len() {
         return None;
     }
@@ -621,9 +653,15 @@ fn partial_cmp_struct(s1: &Arc<StructArray>, s2: &Arc<StructArray>) -> Option<Or
         return None;
     }
 
-    for col_index in 0..s1.num_columns() {
-        let arr1 = s1.column(col_index);
-        let arr2 = s2.column(col_index);
+    let mut expanded_columns1 = Vec::with_capacity(s1.num_columns());
+    let mut expanded_columns2 = Vec::with_capacity(s2.num_columns());
+
+    flatten(s1, &mut expanded_columns1);
+    flatten(s2, &mut expanded_columns2);
+
+    for col_index in 0..expanded_columns1.len() {
+        let arr1 = expanded_columns1[col_index];
+        let arr2 = expanded_columns2[col_index];
 
         let lt_res = arrow::compute::kernels::cmp::lt(arr1, arr2).ok()?;
         let eq_res = arrow::compute::kernels::cmp::eq(arr1, arr2).ok()?;
@@ -1810,10 +1848,6 @@ impl ScalarValue {
     ///
     /// Returns an error if the iterator is empty or if the
     /// [`ScalarValue`]s are not all the same type
-    ///
-    /// # Panics
-    ///
-    /// Panics if `self` is a dictionary with invalid key type
     ///
     /// # Example
     /// ```
@@ -3305,6 +3339,16 @@ impl ScalarValue {
         arr1 == &right
     }
 
+    /// Compare `self` with `other` and return an `Ordering`.
+    ///
+    /// This is the same as [`PartialOrd`] except that it returns
+    /// `Err` if the values cannot be compared, e.g., they have incompatible data types.
+    pub fn try_cmp(&self, other: &Self) -> Result<Ordering> {
+        self.partial_cmp(other).ok_or_else(|| {
+            _internal_datafusion_err!("Uncomparable values: {self:?}, {other:?}")
+        })
+    }
+
     /// Estimate size if bytes including `Self`. For values with internal containers such as `String`
     /// includes the allocated size (`capacity`) rather than the current length (`len`)
     pub fn size(&self) -> usize {
@@ -3411,6 +3455,122 @@ impl ScalarValue {
                 .map(|sv| sv.size() - size_of_val(sv))
                 .sum::<usize>()
     }
+
+    /// Compacts the allocation referenced by `self` to the minimum, copying the data if
+    /// necessary.
+    ///
+    /// This can be relevant when `self` is a list or contains a list as a nested value, as
+    /// a single list holds an Arc to its entire original array buffer.
+    pub fn compact(&mut self) {
+        match self {
+            ScalarValue::Null
+            | ScalarValue::Boolean(_)
+            | ScalarValue::Float16(_)
+            | ScalarValue::Float32(_)
+            | ScalarValue::Float64(_)
+            | ScalarValue::Decimal128(_, _, _)
+            | ScalarValue::Decimal256(_, _, _)
+            | ScalarValue::Int8(_)
+            | ScalarValue::Int16(_)
+            | ScalarValue::Int32(_)
+            | ScalarValue::Int64(_)
+            | ScalarValue::UInt8(_)
+            | ScalarValue::UInt16(_)
+            | ScalarValue::UInt32(_)
+            | ScalarValue::UInt64(_)
+            | ScalarValue::Date32(_)
+            | ScalarValue::Date64(_)
+            | ScalarValue::Time32Second(_)
+            | ScalarValue::Time32Millisecond(_)
+            | ScalarValue::Time64Microsecond(_)
+            | ScalarValue::Time64Nanosecond(_)
+            | ScalarValue::IntervalYearMonth(_)
+            | ScalarValue::IntervalDayTime(_)
+            | ScalarValue::IntervalMonthDayNano(_)
+            | ScalarValue::DurationSecond(_)
+            | ScalarValue::DurationMillisecond(_)
+            | ScalarValue::DurationMicrosecond(_)
+            | ScalarValue::DurationNanosecond(_)
+            | ScalarValue::Utf8(_)
+            | ScalarValue::LargeUtf8(_)
+            | ScalarValue::Utf8View(_)
+            | ScalarValue::TimestampSecond(_, _)
+            | ScalarValue::TimestampMillisecond(_, _)
+            | ScalarValue::TimestampMicrosecond(_, _)
+            | ScalarValue::TimestampNanosecond(_, _)
+            | ScalarValue::Binary(_)
+            | ScalarValue::FixedSizeBinary(_, _)
+            | ScalarValue::LargeBinary(_)
+            | ScalarValue::BinaryView(_) => (),
+            ScalarValue::FixedSizeList(arr) => {
+                let array = copy_array_data(&arr.to_data());
+                *Arc::make_mut(arr) = FixedSizeListArray::from(array);
+            }
+            ScalarValue::List(arr) => {
+                let array = copy_array_data(&arr.to_data());
+                *Arc::make_mut(arr) = ListArray::from(array);
+            }
+            ScalarValue::LargeList(arr) => {
+                let array = copy_array_data(&arr.to_data());
+                *Arc::make_mut(arr) = LargeListArray::from(array)
+            }
+            ScalarValue::Struct(arr) => {
+                let array = copy_array_data(&arr.to_data());
+                *Arc::make_mut(arr) = StructArray::from(array);
+            }
+            ScalarValue::Map(arr) => {
+                let array = copy_array_data(&arr.to_data());
+                *Arc::make_mut(arr) = MapArray::from(array);
+            }
+            ScalarValue::Union(val, _, _) => {
+                if let Some((_, value)) = val.as_mut() {
+                    value.compact();
+                }
+            }
+            ScalarValue::Dictionary(_, value) => {
+                value.compact();
+            }
+        }
+    }
+
+    /// Compacts ([ScalarValue::compact]) the current [ScalarValue] and returns it.
+    pub fn compacted(mut self) -> Self {
+        self.compact();
+        self
+    }
+}
+
+/// Compacts the data of an `ArrayData` into a new `ArrayData`.
+///
+/// This is useful when you want to minimize the memory footprint of an
+/// `ArrayData`. For example, the value returned by [`Array::slice`] still
+/// points at the same underlying data buffers as the original array, which may
+/// hold many more values. Calling `copy_array_data` on the sliced array will
+/// create a new, smaller, `ArrayData` that only contains the data for the
+/// sliced array.
+///
+/// # Example
+/// ```
+/// # use arrow::array::{make_array, Array, Int32Array};
+/// use datafusion_common::scalar::copy_array_data;
+/// let array = Int32Array::from_iter_values(0..8192);
+/// // Take only the first 2 elements
+/// let sliced_array = array.slice(0, 2);
+/// // The memory footprint of `sliced_array` is close to 8192 * 4 bytes
+/// assert_eq!(32864, sliced_array.get_array_memory_size());
+/// // however, we can copy the data to a new `ArrayData`
+/// let new_array = make_array(copy_array_data(&sliced_array.into_data()));
+/// // The memory footprint of `new_array` is now only 2 * 4 bytes
+/// // and overhead:
+/// assert_eq!(160, new_array.get_array_memory_size());
+/// ```
+///
+/// See also [`ScalarValue::compact`] which applies to `ScalarValue` instances
+/// as necessary.
+pub fn copy_array_data(src_data: &ArrayData) -> ArrayData {
+    let mut copy = MutableArrayData::new(vec![&src_data], true, src_data.len());
+    copy.extend(0, 0, src_data.len());
+    copy.freeze()
 }
 
 macro_rules! impl_scalar {
@@ -3663,12 +3823,28 @@ impl fmt::Display for ScalarValue {
             ScalarValue::List(arr) => fmt_list(arr.to_owned() as ArrayRef, f)?,
             ScalarValue::LargeList(arr) => fmt_list(arr.to_owned() as ArrayRef, f)?,
             ScalarValue::FixedSizeList(arr) => fmt_list(arr.to_owned() as ArrayRef, f)?,
-            ScalarValue::Date32(e) => {
-                format_option!(f, e.map(|v| Date32Type::to_naive_date(v).to_string()))?
-            }
-            ScalarValue::Date64(e) => {
-                format_option!(f, e.map(|v| Date64Type::to_naive_date(v).to_string()))?
-            }
+            ScalarValue::Date32(e) => format_option!(
+                f,
+                e.map(|v| {
+                    let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+                    match epoch.checked_add_signed(Duration::try_days(v as i64).unwrap())
+                    {
+                        Some(date) => date.to_string(),
+                        None => "".to_string(),
+                    }
+                })
+            )?,
+            ScalarValue::Date64(e) => format_option!(
+                f,
+                e.map(|v| {
+                    let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+                    match epoch.checked_add_signed(Duration::try_milliseconds(v).unwrap())
+                    {
+                        Some(date) => date.to_string(),
+                        None => "".to_string(),
+                    }
+                })
+            )?,
             ScalarValue::Time32Second(e) => format_option!(f, e)?,
             ScalarValue::Time32Millisecond(e) => format_option!(f, e)?,
             ScalarValue::Time64Microsecond(e) => format_option!(f, e)?,
@@ -3739,7 +3915,7 @@ impl fmt::Display for ScalarValue {
                                         array_value_to_string(arr.column(0), i).unwrap();
                                     let value =
                                         array_value_to_string(arr.column(1), i).unwrap();
-                                    buffer.push_back(format!("{}:{}", key, value));
+                                    buffer.push_back(format!("{key}:{value}"));
                                 }
                                 format!(
                                     "{{{}}}",
@@ -3758,7 +3934,7 @@ impl fmt::Display for ScalarValue {
                 )?
             }
             ScalarValue::Union(val, _fields, _mode) => match val {
-                Some((id, val)) => write!(f, "{}:{}", id, val)?,
+                Some((id, val)) => write!(f, "{id}:{val}")?,
                 None => write!(f, "NULL")?,
             },
             ScalarValue::Dictionary(_k, v) => write!(f, "{v}")?,
@@ -3935,7 +4111,7 @@ impl fmt::Debug for ScalarValue {
                 write!(f, "DurationNanosecond(\"{self}\")")
             }
             ScalarValue::Union(val, _fields, _mode) => match val {
-                Some((id, val)) => write!(f, "Union {}:{}", id, val),
+                Some((id, val)) => write!(f, "Union {id}:{val}"),
                 None => write!(f, "Union(NULL)"),
             },
             ScalarValue::Dictionary(k, v) => write!(f, "Dictionary({k:?}, {v:?})"),
@@ -4059,7 +4235,7 @@ mod tests {
 
     #[test]
     #[should_panic(
-        expected = "Error building ScalarValue::Struct. Expected array with exactly one element, found array with 4 elements"
+        expected = "InvalidArgumentError(\"Incorrect array length for StructArray field \\\"bool\\\", expected 1 got 4\")"
     )]
     fn test_scalar_value_from_for_struct_should_panic() {
         let _ = ScalarStructBuilder::new()
@@ -4592,6 +4768,32 @@ mod tests {
     }
 
     #[test]
+    fn test_try_cmp() {
+        assert_eq!(
+            ScalarValue::try_cmp(
+                &ScalarValue::Int32(Some(1)),
+                &ScalarValue::Int32(Some(2))
+            )
+            .unwrap(),
+            Ordering::Less
+        );
+        assert_eq!(
+            ScalarValue::try_cmp(&ScalarValue::Int32(None), &ScalarValue::Int32(Some(2)))
+                .unwrap(),
+            Ordering::Less
+        );
+        assert_starts_with(
+            ScalarValue::try_cmp(
+                &ScalarValue::Int32(Some(1)),
+                &ScalarValue::Int64(Some(2)),
+            )
+            .unwrap_err()
+            .message(),
+            "Uncomparable values: Int32(1), Int64(2)",
+        );
+    }
+
+    #[test]
     fn scalar_decimal_test() -> Result<()> {
         let decimal_value = ScalarValue::Decimal128(Some(123), 10, 1);
         assert_eq!(DataType::Decimal128(10, 1), decimal_value.data_type());
@@ -4752,6 +4954,109 @@ mod tests {
                 ])]),
             ));
         assert_eq!(a.partial_cmp(&b), Some(Ordering::Less));
+
+        let a =
+            ScalarValue::List(Arc::new(
+                ListArray::from_iter_primitive::<Int64Type, _, _>(vec![Some(vec![
+                    Some(1),
+                    Some(2),
+                    Some(3),
+                ])]),
+            ));
+        let b =
+            ScalarValue::List(Arc::new(
+                ListArray::from_iter_primitive::<Int64Type, _, _>(vec![Some(vec![
+                    Some(2),
+                    Some(3),
+                ])]),
+            ));
+        assert_eq!(a.partial_cmp(&b), Some(Ordering::Less));
+
+        let a =
+            ScalarValue::List(Arc::new(
+                ListArray::from_iter_primitive::<Int64Type, _, _>(vec![Some(vec![
+                    Some(2),
+                    Some(3),
+                    Some(4),
+                ])]),
+            ));
+        let b =
+            ScalarValue::List(Arc::new(
+                ListArray::from_iter_primitive::<Int64Type, _, _>(vec![Some(vec![
+                    Some(1),
+                    Some(2),
+                ])]),
+            ));
+        assert_eq!(a.partial_cmp(&b), Some(Ordering::Greater));
+
+        let a =
+            ScalarValue::List(Arc::new(
+                ListArray::from_iter_primitive::<Int64Type, _, _>(vec![Some(vec![
+                    Some(1),
+                    Some(2),
+                    Some(3),
+                ])]),
+            ));
+        let b =
+            ScalarValue::List(Arc::new(
+                ListArray::from_iter_primitive::<Int64Type, _, _>(vec![Some(vec![
+                    Some(1),
+                    Some(2),
+                ])]),
+            ));
+        assert_eq!(a.partial_cmp(&b), Some(Ordering::Greater));
+
+        let a =
+            ScalarValue::List(Arc::new(
+                ListArray::from_iter_primitive::<Int64Type, _, _>(vec![Some(vec![
+                    None,
+                    Some(2),
+                    Some(3),
+                ])]),
+            ));
+        let b =
+            ScalarValue::List(Arc::new(
+                ListArray::from_iter_primitive::<Int64Type, _, _>(vec![Some(vec![
+                    Some(1),
+                    Some(2),
+                    Some(3),
+                ])]),
+            ));
+        assert_eq!(a.partial_cmp(&b), Some(Ordering::Greater));
+
+        let a = ScalarValue::LargeList(Arc::new(LargeListArray::from_iter_primitive::<
+            Int64Type,
+            _,
+            _,
+        >(vec![Some(vec![
+            None,
+            Some(2),
+            Some(3),
+        ])])));
+        let b = ScalarValue::LargeList(Arc::new(LargeListArray::from_iter_primitive::<
+            Int64Type,
+            _,
+            _,
+        >(vec![Some(vec![
+            Some(1),
+            Some(2),
+            Some(3),
+        ])])));
+        assert_eq!(a.partial_cmp(&b), Some(Ordering::Greater));
+
+        let a = ScalarValue::FixedSizeList(Arc::new(
+            FixedSizeListArray::from_iter_primitive::<Int64Type, _, _>(
+                vec![Some(vec![None, Some(2), Some(3)])],
+                3,
+            ),
+        ));
+        let b = ScalarValue::FixedSizeList(Arc::new(
+            FixedSizeListArray::from_iter_primitive::<Int64Type, _, _>(
+                vec![Some(vec![Some(1), Some(2), Some(3)])],
+                3,
+            ),
+        ));
+        assert_eq!(a.partial_cmp(&b), Some(Ordering::Greater));
     }
 
     #[test]
@@ -6974,6 +7279,19 @@ mod tests {
     }
 
     #[test]
+    fn test_display_date64_large_values() {
+        assert_eq!(
+            format!("{}", ScalarValue::Date64(Some(790179464505))),
+            "1995-01-15"
+        );
+        // This used to panic, see https://github.com/apache/arrow-rs/issues/7728
+        assert_eq!(
+            format!("{}", ScalarValue::Date64(Some(-790179464505600000))),
+            ""
+        );
+    }
+
+    #[test]
     fn test_struct_display_null() {
         let fields = vec![Field::new("a", DataType::Int32, false)];
         let s = ScalarStructBuilder::new_null(fields);
@@ -7162,14 +7480,14 @@ mod tests {
     fn get_random_timestamps(sample_size: u64) -> Vec<ScalarValue> {
         let vector_size = sample_size;
         let mut timestamp = vec![];
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         for i in 0..vector_size {
-            let year = rng.gen_range(1995..=2050);
-            let month = rng.gen_range(1..=12);
-            let day = rng.gen_range(1..=28); // to exclude invalid dates
-            let hour = rng.gen_range(0..=23);
-            let minute = rng.gen_range(0..=59);
-            let second = rng.gen_range(0..=59);
+            let year = rng.random_range(1995..=2050);
+            let month = rng.random_range(1..=12);
+            let day = rng.random_range(1..=28); // to exclude invalid dates
+            let hour = rng.random_range(0..=23);
+            let minute = rng.random_range(0..=59);
+            let second = rng.random_range(0..=59);
             if i % 4 == 0 {
                 timestamp.push(ScalarValue::TimestampSecond(
                     Some(
@@ -7183,7 +7501,7 @@ mod tests {
                     None,
                 ))
             } else if i % 4 == 1 {
-                let millisec = rng.gen_range(0..=999);
+                let millisec = rng.random_range(0..=999);
                 timestamp.push(ScalarValue::TimestampMillisecond(
                     Some(
                         NaiveDate::from_ymd_opt(year, month, day)
@@ -7196,7 +7514,7 @@ mod tests {
                     None,
                 ))
             } else if i % 4 == 2 {
-                let microsec = rng.gen_range(0..=999_999);
+                let microsec = rng.random_range(0..=999_999);
                 timestamp.push(ScalarValue::TimestampMicrosecond(
                     Some(
                         NaiveDate::from_ymd_opt(year, month, day)
@@ -7209,7 +7527,7 @@ mod tests {
                     None,
                 ))
             } else if i % 4 == 3 {
-                let nanosec = rng.gen_range(0..=999_999_999);
+                let nanosec = rng.random_range(0..=999_999_999);
                 timestamp.push(ScalarValue::TimestampNanosecond(
                     Some(
                         NaiveDate::from_ymd_opt(year, month, day)
@@ -7233,27 +7551,27 @@ mod tests {
 
         let vector_size = sample_size;
         let mut intervals = vec![];
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         const SECS_IN_ONE_DAY: i32 = 86_400;
         const MICROSECS_IN_ONE_DAY: i64 = 86_400_000_000;
         for i in 0..vector_size {
             if i % 4 == 0 {
-                let days = rng.gen_range(0..5000);
+                let days = rng.random_range(0..5000);
                 // to not break second precision
-                let millis = rng.gen_range(0..SECS_IN_ONE_DAY) * 1000;
+                let millis = rng.random_range(0..SECS_IN_ONE_DAY) * 1000;
                 intervals.push(ScalarValue::new_interval_dt(days, millis));
             } else if i % 4 == 1 {
-                let days = rng.gen_range(0..5000);
-                let millisec = rng.gen_range(0..(MILLISECS_IN_ONE_DAY as i32));
+                let days = rng.random_range(0..5000);
+                let millisec = rng.random_range(0..(MILLISECS_IN_ONE_DAY as i32));
                 intervals.push(ScalarValue::new_interval_dt(days, millisec));
             } else if i % 4 == 2 {
-                let days = rng.gen_range(0..5000);
+                let days = rng.random_range(0..5000);
                 // to not break microsec precision
-                let nanosec = rng.gen_range(0..MICROSECS_IN_ONE_DAY) * 1000;
+                let nanosec = rng.random_range(0..MICROSECS_IN_ONE_DAY) * 1000;
                 intervals.push(ScalarValue::new_interval_mdn(0, days, nanosec));
             } else {
-                let days = rng.gen_range(0..5000);
-                let nanosec = rng.gen_range(0..NANOSECS_IN_ONE_DAY);
+                let days = rng.random_range(0..5000);
+                let nanosec = rng.random_range(0..NANOSECS_IN_ONE_DAY);
                 intervals.push(ScalarValue::new_interval_mdn(0, days, nanosec));
             }
         }
@@ -7382,5 +7700,16 @@ mod tests {
             .unwrap(),
         ];
         assert!(scalars.iter().all(|s| s.is_null()));
+    }
+
+    // `err.to_string()` depends on backtrace being present (may have backtrace appended)
+    // `err.strip_backtrace()` also depends on backtrace being present (may have "This was likely caused by ..." stripped)
+    fn assert_starts_with(actual: impl AsRef<str>, expected_prefix: impl AsRef<str>) {
+        let actual = actual.as_ref();
+        let expected_prefix = expected_prefix.as_ref();
+        assert!(
+            actual.starts_with(expected_prefix),
+            "Expected '{actual}' to start with '{expected_prefix}'"
+        );
     }
 }
