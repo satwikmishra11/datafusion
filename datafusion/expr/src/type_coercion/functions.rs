@@ -449,10 +449,30 @@ fn try_coerce_types(
     }
 
     // none possible -> Error
-    plan_err!(
-        "Failed to coerce arguments to satisfy a call to '{function_name}' function: coercion from {} to the signature {type_signature} failed",
-        current_types.iter().join(", ")
-    )
+    let mut arg_index = None;
+    let mut expected_types_str = type_signature.to_string();
+    let mut actual_type_str = String::new();
+    if valid_types.len() == 1 {
+        let expected_types = &valid_types[0];
+        for (i, (current, expected)) in current_types.iter().zip(expected_types.iter()).enumerate() {
+            if maybe_data_types(&[expected.clone()], &[current.clone()]).is_none() {
+                arg_index = Some(i);
+                expected_types_str = expected.to_string();
+                actual_type_str = current.to_string();
+                break;
+            }
+        }
+    }
+
+    Err(datafusion_common::DataFusionError::TypeCoercion {
+        message: format!(
+            "Failed to coerce arguments to satisfy a call to '{function_name}' function: coercion from {} to the signature {type_signature} failed",
+            current_types.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(", ")
+        ),
+        arg_index,
+        expected_types: expected_types_str,
+        actual_type: actual_type_str,
+    })
 }
 
 fn get_valid_types_with_udf<F: UDFCoercionExt>(

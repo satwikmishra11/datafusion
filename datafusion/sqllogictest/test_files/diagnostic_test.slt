@@ -1,0 +1,5 @@
+statement error
+SELECT sqrt('hello');
+
+statement error
+SELECT abs(true);

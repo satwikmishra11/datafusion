@@ -143,6 +143,17 @@ pub enum DataFusionError {
     ///
     /// For example, a custom S3Error from the crate datafusion-objectstore-s3
     External(GenericError),
+    /// Error during type coercion.
+    TypeCoercion {
+        /// The general error message
+        message: String,
+        /// The optional index of the offending argument
+        arg_index: Option<usize>,
+        /// The expected types (from the signature)
+        expected_types: String,
+        /// The actual type of the offending argument
+        actual_type: String,
+    },
     /// Error with additional context
     Context(String, Box<DataFusionError>),
     /// Errors from either mapping LogicalPlans to/from Substrait plans
@@ -526,6 +537,7 @@ impl DataFusionError {
                 "Resources exhausted: "
             }
             DataFusionError::External(_) => "External error: ",
+            DataFusionError::TypeCoercion { .. } => "Type coercion error: ",
             DataFusionError::Context(_, _) => "",
             DataFusionError::Substrait(_) => "Substrait error: ",
             DataFusionError::Diagnostic(_, _) => "",
@@ -569,6 +581,7 @@ impl DataFusionError {
             DataFusionError::ExecutionJoin(ref desc) => Cow::Owned(desc.to_string()),
             DataFusionError::ResourcesExhausted(ref desc) => Cow::Owned(desc.to_string()),
             DataFusionError::External(ref desc) => Cow::Owned(desc.to_string()),
+            DataFusionError::TypeCoercion { ref message, .. } => Cow::Owned(message.to_string()),
             #[cfg(feature = "object_store")]
             DataFusionError::ObjectStore(ref desc) => Cow::Owned(desc.to_string()),
             DataFusionError::Context(ref desc, ref err) => {
