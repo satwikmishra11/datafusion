@@ -40,7 +40,7 @@ use datafusion_expr_common::{
     type_coercion::binary::comparison_coercion,
     type_coercion::binary::string_coercion,
 };
-use itertools::Itertools as _;
+
 use std::sync::Arc;
 
 /// Extension trait to unify common functionality between [`ScalarUDF`], [`AggregateUDF`]
@@ -441,8 +441,8 @@ fn try_coerce_types(
         // TODO: Deprecate this branch after all signatures are well-supported (aka coercion has happened already)
         // Try and coerce the argument types to match the signature, returning the
         // coerced types from the first matching signature.
-        for valid_types in valid_types {
-            if let Some(types) = maybe_data_types(&valid_types, current_types) {
+        for valid_t in &valid_types {
+            if let Some(types) = maybe_data_types(valid_t, current_types) {
                 return Ok(types);
             }
         }
