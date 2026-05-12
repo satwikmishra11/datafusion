@@ -351,25 +351,46 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             // After resolution, all arguments are positional
             let inner = ScalarFunction::new_udf(fm, resolved_args);
 
-            let current_fields = inner.args.iter().map(|e| e.to_field(schema).map(|(_, f)| f)).collect::<Result<Vec<_>>>();
+            let current_fields = inner
+                .args
+                .iter()
+                .map(|e| e.to_field(schema).map(|(_, f)| f))
+                .collect::<Result<Vec<_>>>();
             if let Ok(fields) = current_fields {
-                if let Err(e) = datafusion_expr::type_coercion::functions::fields_with_udf(&fields, inner.func.as_ref()) {
-                    let extracted = if let datafusion_common::DataFusionError::TypeCoercion { message: msg, arg_index: Some(idx), expected_types, actual_type } = &e {
-                        Some((msg.clone(), *idx, expected_types.clone(), actual_type.clone()))
-                    } else {
-                        None
-                    };
+                if let Err(e) = datafusion_expr::type_coercion::functions::fields_with_udf(
+                    &fields,
+                    inner.func.as_ref(),
+                ) {
+                    let extracted =
+                        if let datafusion_common::DataFusionError::TypeCoercion {
+                            message: msg,
+                            arg_index: Some(idx),
+                            expected_types,
+                            actual_type,
+                        } = &e
+                        {
+                            Some((
+                                msg.clone(),
+                                *idx,
+                                expected_types.clone(),
+                                actual_type.clone(),
+                            ))
+                        } else {
+                            None
+                        };
 
                     if let Some((msg, idx, expected_types, actual_type)) = extracted {
                         if let Some(arg) = original_args.get(idx) {
-                            let span = Span::try_from_sqlparser_span(
-                                match arg {
-                                    FunctionArg::Named { arg, .. } => arg.span(),
-                                    FunctionArg::Unnamed(arg) => arg.span(),
-                                }
+                            let span = Span::try_from_sqlparser_span(match arg {
+                                FunctionArg::Named { arg, .. } => arg.span(),
+                                FunctionArg::Unnamed(arg) => arg.span(),
+                            });
+                            let diagnostic = Diagnostic::new_error(msg, span).with_note(
+                                format!(
+                                    "Expected {expected_types}, but found {actual_type}"
+                                ),
+                                span,
                             );
-                            let diagnostic = Diagnostic::new_error(msg, span)
-                                .with_note(format!("Expected {expected_types}, but found {actual_type}"), span);
                             return Err(e.with_diagnostic(diagnostic));
                         }
                     }

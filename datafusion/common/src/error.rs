@@ -414,6 +414,7 @@ impl Error for DataFusionError {
             // can't be executed.
             DataFusionError::Collection(errs) => errs.first().map(|e| e as &dyn Error),
             DataFusionError::Shared(e) => Some(e.as_ref()),
+            DataFusionError::TypeCoercion { .. } => None,
             DataFusionError::Ffi(_) => None,
         }
     }
@@ -581,7 +582,9 @@ impl DataFusionError {
             DataFusionError::ExecutionJoin(ref desc) => Cow::Owned(desc.to_string()),
             DataFusionError::ResourcesExhausted(ref desc) => Cow::Owned(desc.to_string()),
             DataFusionError::External(ref desc) => Cow::Owned(desc.to_string()),
-            DataFusionError::TypeCoercion { ref message, .. } => Cow::Owned(message.to_string()),
+            DataFusionError::TypeCoercion { ref message, .. } => {
+                Cow::Owned(message.to_string())
+            }
             #[cfg(feature = "object_store")]
             DataFusionError::ObjectStore(ref desc) => Cow::Owned(desc.to_string()),
             DataFusionError::Context(ref desc, ref err) => {
